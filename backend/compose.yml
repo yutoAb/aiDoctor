@@ -1,0 +1,38 @@
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # ローカル開発ではホットリロードしたい場合に便利
+    volumes:
+      - .:/app
+    ports:
+      - "5000:5000"
+    environment:
+      # Flask 側が読み取る DB 接続文字列（SQLAlchemy / psycopg2 どちらでも使える一般的な形）
+      # 例: SQLAlchemy なら postgresql+psycopg2://、純粋にドライバなら postgresql:// でもOK
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/appdb
+      FLASK_APP: app.main
+      FLASK_ENV: development
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
