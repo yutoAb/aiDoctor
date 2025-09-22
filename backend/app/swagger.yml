@@ -1,0 +1,138 @@
+swagger: "2.0"
+info:
+  title: Todo API
+  version: "1.0.0"
+  description: Simple Todo API for development
+schemes:
+  - http
+host: localhost:5000
+basePath: /
+
+paths:
+  /api/health:
+    get:
+      tags: [health]
+      summary: Health check
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: Service alive
+          schema:
+            $ref: "#/definitions/Health"
+          examples:
+            application/json:
+              status: ok
+              service: flask-backend
+
+  /api/todos:
+    get:
+      tags: [todos]
+      summary: List todos
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: Array of todos
+          schema:
+            type: array
+            items:
+              $ref: "#/definitions/Todo"
+          examples:
+            application/json:
+              - id: 1
+                title: first task
+    post:
+      tags: [todos]
+      summary: Create a new todo
+      consumes:
+        - application/json
+      produces:
+        - application/json
+      parameters:
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/CreateTodoInput"
+          x-examples:
+            application/json:
+              title: buy milk
+      responses:
+        "201":
+          description: Created todo
+          schema:
+            $ref: "#/definitions/Todo"
+          examples:
+            application/json:
+              id: 2
+              title: buy milk
+        "400":
+          description: Bad request (title is required)
+          schema:
+            $ref: "#/definitions/Error"
+          examples:
+            application/json:
+              error: title is required
+
+  /api/todos/{todo_id}:
+    delete:
+      tags: [todos]
+      summary: Delete a todo
+      parameters:
+        - in: path
+          name: todo_id
+          description: ID of the todo to delete
+          required: true
+          type: integer
+          format: int64
+      responses:
+        "204":
+          description: Deleted (no content)
+        "404":
+          description: Not found
+          schema:
+            $ref: "#/definitions/Error"
+          examples:
+            application/json:
+              error: "todo id=9999 not found"
+
+definitions:
+  Health:
+    type: object
+    required: [status, service]
+    properties:
+      status:
+        type: string
+        example: ok
+      service:
+        type: string
+        example: flask-backend
+
+  Todo:
+    type: object
+    required: [id, title]
+    properties:
+      id:
+        type: integer
+        format: int64
+        example: 1
+      title:
+        type: string
+        example: first task
+
+  CreateTodoInput:
+    type: object
+    required: [title]
+    properties:
+      title:
+        type: string
+        example: buy milk
+
+  Error:
+    type: object
+    required: [error]
+    properties:
+      error:
+        type: string
+        example: title is required
