@@ -453,6 +453,24 @@ export default function ConsultByIdPage() {
     setInput((v) => `${v ? v + "\n" : ""}${templates[kind]}`);
   }, []);
 
+  // 診察終了処理
+  const handleEndConsult = useCallback(async () => {
+    try {
+      // 必要に応じてサーバーに終了APIを送る
+      await fetch(
+        `${API_BASE}/api/encounters/${encodeURIComponent(
+          String(encounterId)
+        )}/end`,
+        { method: "POST" }
+      );
+    } catch (e) {
+      console.error("診察終了APIエラー:", e);
+    } finally {
+      // トップページへ戻す
+      router.push("/");
+    }
+  }, [encounterId, router]);
+
   if (!encounterId) {
     return (
       <Container sx={{ py: 6 }}>
@@ -501,6 +519,18 @@ export default function ConsultByIdPage() {
             <Typography variant="caption" color="text.secondary">
               Enterで送信 / Shift+Enterで改行
             </Typography>
+          </Stack>
+
+          {/* === 診察終了ボタン === */}
+          <Divider sx={{ my: 2 }} />
+          <Stack direction="row" justifyContent="flex-end">
+            <Button
+              variant="contained"
+              color="error"
+              onClick={handleEndConsult}
+            >
+              診察終了
+            </Button>
           </Stack>
         </Stack>
       </Container>
