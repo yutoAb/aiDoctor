@@ -1,12 +1,27 @@
 swagger: "2.0"
 info:
-  title: Todo API
+  title: aiDoctor Backend API
   version: "1.0.0"
-  description: Simple Todo API for development
+  description: |
+    Flask + SQLAlchemy ベースの簡易診療チャット API。
+    - DB は `encounter`（セッション）と `message`（会話ログ）
+    - OpenAI キー未設定時はダミー応答をストリーム
 schemes:
   - http
 host: localhost:5000
 basePath: /
+
+tags:
+  - name: health
+    description: ヘルスチェック
+  - name: encounters
+    description: 診察セッションの作成/参照
+  - name: messages
+    description: 会話メッセージの投稿/ストリーム取得
+  - name: templates
+    description: テンプレート文
+  - name: debug
+    description: デバッグ用
 
 paths:
   /api/health:
@@ -24,27 +39,59 @@ paths:
             application/json:
               status: ok
               service: flask-backend
+              db: ok
 
-  /api/todos:
+  /api/encounters:
     get:
-      tags: [todos]
-      summary: List todos
+      tags: [encounters]
+      summary: 診察セッション一覧
+      description: |
+        診察セッションを新しい開始時刻順にページングして返します。
       produces:
         - application/json
+      parameters:
+        - in: query
+          name: status
+          description: フィルタ（active | closed）
+          required: false
+          type: string
+          enum: [active, closed]
+        - in: query
+          name: limit
+          description: 1..200（デフォルト 50）
+          required: false
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 200
+        - in: query
+          name: offset
+          description: 0..（デフォルト 0）
+          required: false
+          type: integer
+          format: int32
+          minimum: 0
       responses:
         "200":
-          description: Array of todos
+          description: Encounter の配列
           schema:
             type: array
             items:
-              $ref: "#/definitions/Todo"
+              $ref: "#/definitions/EncounterListItem"
           examples:
             application/json:
-              - id: 1
-                title: first task
+              - id: "8e9e8d5a-6c2b-4f6f-8b5a-4e1e1c5f44d2"
+                chiefComplaint: "胸が痛い"
+                status: "active"
+                startedAt: "2025-09-23T03:25:00+00:00"
+                endedAt: null
+                triageLevel: null
+                needsAttention: false
+
+  /consult/new:
     post:
-      tags: [todos]
-      summary: Create a new todo
+      tags: [encounters]
+      summary: 診察セッション作成
       consumes:
         - application/json
       produces:
@@ -52,55 +99,139 @@ paths:
       parameters:
         - in: body
           name: body
-          required: true
+          required: false
           schema:
-            $ref: "#/definitions/CreateTodoInput"
+            $ref: "#/definitions/CreateEncounterInput"
           x-examples:
             application/json:
-              title: buy milk
+              chief_complaint: "咳が止まらない"
       responses:
         "201":
-          description: Created todo
+          description: 作成成功
           schema:
-            $ref: "#/definitions/Todo"
+            $ref: "#/definitions/CreateEncounterResponse"
           examples:
             application/json:
-              id: 2
-              title: buy milk
-        "400":
-          description: Bad request (title is required)
-          schema:
-            $ref: "#/definitions/Error"
-          examples:
-            application/json:
-              error: title is required
+              encounter_id: "1209d7ba-00d3-476c-90df-5e95116a5f28"
 
-  /api/todos/{todo_id}:
-    delete:
-      tags: [todos]
-      summary: Delete a todo
+  /api/templates/first-message:
+    get:
+      tags: [templates]
+      summary: 初手テンプレ文を返す
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: テンプレ文
+          schema:
+            $ref: "#/definitions/FirstMessageTemplate"
+          examples:
+            application/json:
+              content: "本日はどうなさいましたか？"
+              locale: "ja-JP"
+
+  /api/encounters/{encounter_id}/messages:
+    post:
+      tags: [messages]
+      summary: ユーザ/システム発言を保存
+      consumes:
+        - application/json
+      produces:
+        - application/json
       parameters:
         - in: path
-          name: todo_id
-          description: ID of the todo to delete
+          name: encounter_id
+          description: 対象 Encounter の UUID
           required: true
-          type: integer
-          format: int64
+          type: string
+        - in: body
+          name: body
+          required: true
+          schema:
+            $ref: "#/definitions/PostMessageInput"
+          x-examples:
+            application/json:
+              role: "user"
+              content: "昨日から発熱があります"
       responses:
-        "204":
-          description: Deleted (no content)
-        "404":
-          description: Not found
+        "200":
+          description: 受理
+          schema:
+            $ref: "#/definitions/PostMessageResponse"
+          examples:
+            application/json:
+              message_id: "2c5a6b0e-4a4f-4d09-8f0c-34d7b5c2b4f1"
+              status: "queued"
+        "400":
+          description: バリデーションエラー
           schema:
             $ref: "#/definitions/Error"
           examples:
             application/json:
-              error: "todo id=9999 not found"
+              error: "role must be 'user' or 'system'"
+        "404":
+          description: Encounter が存在しない
+          schema:
+            $ref: "#/definitions/Error"
+          examples:
+            application/json:
+              error: "encounter 00000000-0000-0000-0000-000000000000 not found"
 
+  /api/encounters/{encounter_id}/stream:
+    get:
+      tags: [messages]
+      summary: ストリーミング応答（SSE）
+      description: |
+        既存メッセージ履歴からアシスタント応答をストリーム（Server-Sent Events）で返す。
+        - `event: token` の data に `{ "delta": "..." }` を随時送信
+        - 完了時に `event: done` の data に `{ "messageId": "..." }`
+        - エラー時に `event: error` の data に `{ "message": "..." }`
+      produces:
+        - text/event-stream
+      parameters:
+        - in: path
+          name: encounter_id
+          description: 対象 Encounter の UUID
+          required: true
+          type: string
+      responses:
+        "200":
+          description: Server-Sent Events ストリーム
+          schema:
+            type: string
+            description: text/event-stream
+          examples:
+            text/event-stream: |
+              event: token
+              data: {"delta":"こ"}
+
+              event: token
+              data: {"delta":"ん"}
+
+              event: done
+              data: {"messageId":"c0d8b2e8-2c3e-4b2b-8f1e-12a3b4c5d6e7"}
+
+  /api/debug/openai:
+    get:
+      tags: [debug]
+      summary: OpenAI 接続確認
+      produces:
+        - application/json
+      responses:
+        "200":
+          description: 接続状態
+          schema:
+            oneOf:
+              - $ref: "#/definitions/DebugOk"
+              - $ref: "#/definitions/DebugNg"
+          examples:
+            application/json:
+              ok: true
+              sample: "ピン"
 definitions:
   Health:
     type: object
-    required: [status, service]
+    required: [status, service, db]
     properties:
       status:
         type: string
@@ -108,26 +239,111 @@ definitions:
       service:
         type: string
         example: flask-backend
+      db:
+        type: string
+        example: ok
 
-  Todo:
+  EncounterListItem:
     type: object
-    required: [id, title]
+    required: [id, status, startedAt, triageLevel, needsAttention]
     properties:
       id:
-        type: integer
-        format: int64
-        example: 1
-      title:
         type: string
-        example: first task
+        example: "8e9e8d5a-6c2b-4f6f-8b5a-4e1e1c5f44d2"
+      chiefComplaint:
+        type: string
+        example: "胸が痛い"
+      status:
+        type: string
+        enum: [active, closed]
+        example: active
+      startedAt:
+        type: string
+        format: date-time
+        example: "2025-09-23T03:25:00+00:00"
+      endedAt:
+        type: string
+        format: date-time
+        nullable: true
+        example: null
+      triageLevel:
+        type: string
+        nullable: true
+        example: null
+      needsAttention:
+        type: boolean
+        example: false
 
-  CreateTodoInput:
+  CreateEncounterInput:
     type: object
-    required: [title]
     properties:
-      title:
+      chief_complaint:
         type: string
-        example: buy milk
+        example: "咳が止まらない"
+
+  CreateEncounterResponse:
+    type: object
+    required: [encounter_id]
+    properties:
+      encounter_id:
+        type: string
+        example: "1209d7ba-00d3-476c-90df-5e95116a5f28"
+
+  FirstMessageTemplate:
+    type: object
+    required: [content, locale]
+    properties:
+      content:
+        type: string
+        example: "本日はどうなさいましたか？"
+      locale:
+        type: string
+        example: "ja-JP"
+
+  PostMessageInput:
+    type: object
+    required: [role, content]
+    properties:
+      role:
+        type: string
+        enum: [user, system]
+        example: user
+      content:
+        type: string
+        example: "昨日から発熱があります（38.2℃）"
+
+  PostMessageResponse:
+    type: object
+    required: [message_id, status]
+    properties:
+      message_id:
+        type: string
+        example: "2c5a6b0e-4a4f-4d09-8f0c-34d7b5c2b4f1"
+      status:
+        type: string
+        example: queued
+
+  DebugOk:
+    type: object
+    required: [ok, sample]
+    properties:
+      ok:
+        type: boolean
+        example: true
+      sample:
+        type: string
+        example: "ピン"
+
+  DebugNg:
+    type: object
+    required: [ok, reason]
+    properties:
+      ok:
+        type: boolean
+        example: false
+      reason:
+        type: string
+        example: "client_not_initialized"
 
   Error:
     type: object
@@ -135,4 +351,4 @@ definitions:
     properties:
       error:
         type: string
-        example: title is required
+        example: "encounter x not found"
