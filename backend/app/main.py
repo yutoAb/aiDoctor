@@ -13,18 +13,22 @@ from typing import Iterable, List
 import sqlalchemy as sa
 from sqlalchemy.orm import sessionmaker
 
-# ── OpenAI (任意) ───────────────────────────────────────────────
+# ── OpenAI（Chat Completions を使用） ──────────────────────────
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # 任意のモデル名
+# デフォルトは安全に存在するモデル名を使用
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
+openai_client = None
 try:
     if OPENAI_API_KEY:
-        # openai >= 1.x 系
         from openai import OpenAI
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
+        print("[BOOT] OPENAI_API_KEY set: True", flush=True)
+        print(f"[BOOT] OpenAI client initialized. model={OPENAI_MODEL}", flush=True)
     else:
-        openai_client = None
-except Exception:
+        print("[BOOT] OPENAI_API_KEY set: False → Using DUMMY stream", flush=True)
+except Exception as e:
+    print(f"[BOOT] OpenAI init failed: {e.__class__.__name__}: {e}", flush=True)
     openai_client = None
 
 DATABASE_URL = os.getenv(
@@ -118,14 +122,14 @@ def _sse(event: str, data: dict | str) -> str:
 def _dummy_stream_answer(prompt_tail: str) -> Iterable[str]:
     """
     OpenAIキーが無い場合のダミーストリーム。
-    単純にテンプレ応答を100ms刻みでトークン風に返す。
+    単純にテンプレ応答を刻んで返す。
     """
     text = (
         "それはいつ頃から、どのような状況で症状が出ますか？\n"
         "痛みの強さ（0〜10）、持続時間、増悪・寛解因子（動くと痛い/安静で軽くなる等）も教えてください。"
     )
     for ch in text:
-        time.sleep(0.03)
+        time.sleep(0.02)
         yield ch
 
 
@@ -175,18 +179,18 @@ def create_app():
 
         return jsonify({"encounter_id": encounter_id}), 201
 
-    # === 追加1) 初手テンプレ ===
+    # === 初手テンプレ ===
     @app.get("/api/templates/first-message")
     def first_message():
         # 必要ならDB化/ロケール対応可
         return jsonify({"content": "本日はどうなさいましたか？", "locale": "ja-JP"})
 
-    # === 追加2) ユーザ発言を保存 ===
+    # === ユーザ発言を保存 ===
     @app.post("/api/encounters/<encounter_id>/messages")
     def post_message(encounter_id: str):
         """
         ユーザ/システムの発言を保存する（role: 'user' か 'system' を想定）。
-        応答生成自体は /stream 側で実施する想定。
+        応答生成自体は /stream 側で実施。
         """
         payload = request.get_json(force=True)
         role = payload.get("role")
@@ -212,10 +216,10 @@ def create_app():
             )
             session.commit()
 
-        # ここでは保存のみ。フロントはこの後 /stream を開いて応答を受け取る
+        # 保存のみ。フロントはこの後 /stream を開いて応答を受け取る
         return jsonify({"message_id": msg_id, "status": "queued"}), 200
 
-    # === 追加3) ストリーミング応答（SSE） ===
+    # === ストリーミング応答（SSE） ===
     @app.get("/api/encounters/<encounter_id>/stream")
     def stream_answer(encounter_id: str):
         """
@@ -228,16 +232,14 @@ def create_app():
                     yield _sse("error", {"message": f"encounter {encounter_id} not found"})
                     return
 
-                # 直近履歴を読み込み（system含む既存のもの）
+                # 直近履歴を読み込み
                 history = _load_messages_for_encounter(session, encounter_id)
                 openai_msgs = _to_openai_messages(history)
 
-                # OpenAI でストリーム or ダミー
                 assistant_full = []
                 try:
                     if openai_client is not None:
-                        # Chat Completions (stream)
-                        # openai>=1.x 例: client.chat.completions.create(...)
+                        print(f"[SSE] Using OpenAI chat.completions stream. model={OPENAI_MODEL}", flush=True)
                         stream = openai_client.chat.completions.create(
                             model=OPENAI_MODEL,
                             messages=openai_msgs,
@@ -245,7 +247,6 @@ def create_app():
                             stream=True,
                         )
                         for chunk in stream:
-                            # choices[0].delta.content の断片を取り出す
                             delta = ""
                             try:
                                 delta = chunk.choices[0].delta.content or ""
@@ -255,7 +256,7 @@ def create_app():
                                 assistant_full.append(delta)
                                 yield _sse("token", {"delta": delta})
                     else:
-                        # ダミーストリーム
+                        print("[SSE] Using DUMMY stream (no OpenAI client)", flush=True)
                         for ch in _dummy_stream_answer(history[-1]["content"] if history else ""):
                             assistant_full.append(ch)
                             yield _sse("token", {"delta": ch})
@@ -277,10 +278,39 @@ def create_app():
                     yield _sse("done", {"messageId": msg_id})
 
                 except Exception as e:
-                    # 途中エラーでもストリームを閉じれるように
+                    print(f"[SSE] stream failed: {e.__class__.__name__}: {e}", flush=True)
                     yield _sse("error", {"message": f"stream failed: {e.__class__.__name__}"})
 
-        return Response(stream_with_context(generate()), mimetype="text/event-stream")
+        # バッファリングなどを防ぐためのヘッダを追加
+        return Response(
+            stream_with_context(generate()),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # nginxでのバッファ無効化
+            },
+        )
+
+    # --- 疎通テスト（任意） ---
+    @app.get("/api/debug/openai")
+    def debug_openai():
+        if openai_client is None:
+            return jsonify(ok=False, reason="client_not_initialized"), 200
+        try:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant."},
+                    {"role": "user", "content": "Say ping once in Japanese."},
+                ],
+                max_tokens=8,
+                temperature=0.0,
+            )
+            text = resp.choices[0].message.content
+            return jsonify(ok=True, sample=text), 200
+        except Exception as e:
+            return jsonify(ok=False, reason=f"{e.__class__.__name__}: {e}"), 200
 
     return app
 
