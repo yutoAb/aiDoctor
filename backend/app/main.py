@@ -135,7 +135,6 @@ def _dummy_stream_answer(prompt_tail: str) -> Iterable[str]:
 
 def create_app():
     app = Flask(__name__)
-    # /consult/* と /api/* を CORS 許可
     CORS(app, resources={r"/consult/*": {"origins": "*"}, r"/api/*": {"origins": "*"}})
 
     # Swagger 読み込み
@@ -157,12 +156,72 @@ def create_app():
             db_status = f"ng: {e.__class__.__name__}"
         return jsonify(status="ok", service="flask-backend", db=db_status)
 
+    # === 追加: 診察セッション一覧 ===
+    @app.get("/api/encounters")
+    def list_encounters():
+        """
+        診察セッション一覧を返す。
+        クエリ:
+          - status: 'active' | 'closed'（任意）
+          - limit:  1..200（任意・デフォルト50）
+          - offset: 0..   （任意・デフォルト0）
+        レスポンス（例）:
+          [
+            {
+              "id": "enc_xxx",
+              "chiefComplaint": "胸が痛い",
+              "status": "active",
+              "startedAt": "2025-09-23T03:25:00Z",
+              "endedAt": null,
+              "triageLevel": null,
+              "needsAttention": false
+            },
+            ...
+          ]
+        """
+        status = request.args.get("status")
+        try:
+            limit = max(1, min(int(request.args.get("limit", 50)), 200))
+        except ValueError:
+            limit = 50
+        try:
+            offset = max(0, int(request.args.get("offset", 0)))
+        except ValueError:
+            offset = 0
+
+        stmt = sa.select(
+            encounter_table.c.id,
+            encounter_table.c.chief_complaint,
+            encounter_table.c.status,
+            encounter_table.c.started_at,
+            encounter_table.c.ended_at,
+        ).order_by(encounter_table.c.started_at.desc())
+
+        if status in ("active", "closed"):
+            stmt = stmt.where(encounter_table.c.status == status)
+
+        stmt = stmt.limit(limit).offset(offset)
+
+        with SessionLocal() as session:
+            rows = session.execute(stmt).all()
+
+        def to_camel(r):
+            # triageLevel / needsAttention は今は未実装（null/false）で返す
+            return {
+                "id": r.id,
+                "chiefComplaint": r.chief_complaint,
+                "status": r.status,
+                "startedAt": (r.started_at.isoformat() if r.started_at else None),
+                "endedAt": (r.ended_at.isoformat() if r.ended_at else None),
+                "triageLevel": None,
+                "needsAttention": False,
+            }
+
+        return jsonify([to_camel(r) for r in rows])
+
     # --- 診察セッション作成 ---
     @app.post("/consult/new")
     def create_encounter():
-        """
-        新しい診察セッションを作成し、encounter_id を返す。
-        """
         payload = request.get_json(silent=True) or {}
         chief_complaint = payload.get("chief_complaint")
 
@@ -182,16 +241,11 @@ def create_app():
     # === 初手テンプレ ===
     @app.get("/api/templates/first-message")
     def first_message():
-        # 必要ならDB化/ロケール対応可
         return jsonify({"content": "本日はどうなさいましたか？", "locale": "ja-JP"})
 
     # === ユーザ発言を保存 ===
     @app.post("/api/encounters/<encounter_id>/messages")
     def post_message(encounter_id: str):
-        """
-        ユーザ/システムの発言を保存する（role: 'user' か 'system' を想定）。
-        応答生成自体は /stream 側で実施。
-        """
         payload = request.get_json(force=True)
         role = payload.get("role")
         content = (payload.get("content") or "").strip()
@@ -216,30 +270,23 @@ def create_app():
             )
             session.commit()
 
-        # 保存のみ。フロントはこの後 /stream を開いて応答を受け取る
         return jsonify({"message_id": msg_id, "status": "queued"}), 200
 
     # === ストリーミング応答（SSE） ===
     @app.get("/api/encounters/<encounter_id>/stream")
     def stream_answer(encounter_id: str):
-        """
-        直近までの履歴をもとに、assistant応答をSSEでストリームし、完了後にDBへ保存。
-        event: token で {"delta": "..."} を複数回、最後に event: done で {"messageId": "..."} を送る。
-        """
-        def generate() -> Iterable[str]:
+        def generate():
             with SessionLocal() as session:
                 if not _encounter_exists(session, encounter_id):
                     yield _sse("error", {"message": f"encounter {encounter_id} not found"})
                     return
 
-                # 直近履歴を読み込み
                 history = _load_messages_for_encounter(session, encounter_id)
                 openai_msgs = _to_openai_messages(history)
 
                 assistant_full = []
                 try:
                     if openai_client is not None:
-                        print(f"[SSE] Using OpenAI chat.completions stream. model={OPENAI_MODEL}", flush=True)
                         stream = openai_client.chat.completions.create(
                             model=OPENAI_MODEL,
                             messages=openai_msgs,
@@ -256,12 +303,10 @@ def create_app():
                                 assistant_full.append(delta)
                                 yield _sse("token", {"delta": delta})
                     else:
-                        print("[SSE] Using DUMMY stream (no OpenAI client)", flush=True)
                         for ch in _dummy_stream_answer(history[-1]["content"] if history else ""):
                             assistant_full.append(ch)
                             yield _sse("token", {"delta": ch})
 
-                    # 応答を保存
                     final_text = "".join(assistant_full).strip()
                     msg_id = str(uuid.uuid4())
                     session.execute(
@@ -278,21 +323,14 @@ def create_app():
                     yield _sse("done", {"messageId": msg_id})
 
                 except Exception as e:
-                    print(f"[SSE] stream failed: {e.__class__.__name__}: {e}", flush=True)
                     yield _sse("error", {"message": f"stream failed: {e.__class__.__name__}"})
 
-        # バッファリングなどを防ぐためのヘッダを追加
         return Response(
             stream_with_context(generate()),
             mimetype="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",  # nginxでのバッファ無効化
-            },
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
         )
 
-    # --- 疎通テスト（任意） ---
     @app.get("/api/debug/openai")
     def debug_openai():
         if openai_client is None:
@@ -313,7 +351,6 @@ def create_app():
             return jsonify(ok=False, reason=f"{e.__class__.__name__}: {e}"), 200
 
     return app
-
 
 app = create_app()
 
