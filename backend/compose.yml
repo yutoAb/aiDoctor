@@ -25,6 +25,7 @@ services:
     ports:
       - "5000:5000"
     environment:
+      OPENAI_API_KEY: ${OPENAI_API_KEY}
       # Flask 側が読み取る DB 接続文字列（SQLAlchemy / psycopg2 どちらでも使える一般的な形）
       # 例: SQLAlchemy なら postgresql+psycopg2://、純粋にドライバなら postgresql:// でもOK
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/appdb

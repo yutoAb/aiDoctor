@@ -1,8 +1,17 @@
+# Web framework
 flask==3.0.3
 flask-cors==4.0.1
-python-dotenv==1.0.1
 flasgger==0.9.7.1
 PyYAML==6.0.2
+python-dotenv==1.0.1
 
+# Database
 SQLAlchemy==2.0.34
 psycopg2-binary==2.9.9
+
+# OpenAI API (chat + streaming)
+openai==1.51.2
+httpx==0.27.2 
+
+# 型サポートや開発補助（任意）
+typing-extensions>=4.12.2
