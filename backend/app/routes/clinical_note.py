@@ -1,12 +1,15 @@
 # app/routes/clinical_note.py
+from __future__ import annotations
 from flask import Blueprint, jsonify, request
 from datetime import datetime
-from openai import OpenAI
-import os
+
+from app.shared import (
+    SessionLocal, encounter_table, message_table,
+    load_messages_for_encounter, encounter_exists,
+    openai_client, OPENAI_MODEL
+)
 
 bp = Blueprint("clinical_note", __name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 SYSTEM_PROMPT = """あなたは日本の内科医です。以下の対話履歴をもとに、医療現場で使える簡潔で網羅的なカルテ（Markdown）を作成します。
 - 日本語、見出し付き(Markdown)
@@ -15,53 +18,57 @@ SYSTEM_PROMPT = """あなたは日本の内科医です。以下の対話履歴�
 - 緊急を要する可能性がある所見はPlan内に注意喚起
 """
 
-def build_user_content(encounter_id: str):
-    # DBから対話を時系列で取得
-    msgs = (
-        Message.query.filter_by(encounter_id=encounter_id)
-        .order_by(Message.created_at.asc())
-        .all()
-    )
-    lines = []
-    for m in msgs:
-        who = "患者" if m.role == "user" else ("AI" if m.role == "assistant" else "システム")
-        ts = m.created_at.strftime("%Y-%m-%d %H:%M")
-        lines.append(f"[{ts}] {who}: {m.content}")
-    return "\n".join(lines)
+@bp.post("/api/encounters/<encounter_id>/clinical-note")
+def generate_clinical_note(encounter_id: str):
+    with SessionLocal() as session:
+        if not encounter_exists(session, encounter_id):
+            return jsonify(error=f"encounter {encounter_id} not found"), 404
 
-@bp.route("/api/encounters/<encounter_id>/clinical-note", methods=["POST"])
-def generate_note(encounter_id):
-    # 1) 会話をまとめる
-    convo = build_user_content(encounter_id)
-    if not convo.strip():
-        return jsonify({"error": "no messages"}), 400
+        # 会話履歴を時系列で取得し、素朴にテキスト化
+        rows = load_messages_for_encounter(session, encounter_id)
+        convo_lines = []
+        for m in rows:
+            who = "患者" if m["role"] == "user" else ("AI" if m["role"] == "assistant" else "システム")
+            # created_at はここでは返していないため省略（必要ならSELECTを拡張）
+            convo_lines.append(f"{who}: {m['content']}")
+        convo = "\n".join(convo_lines)
 
-    # 2) 必要なら主訴をざっくり抽出（簡易）
-    #   直近の患者メッセージから拾う等、ここは任意
-    last_user = (
-        Message.query.filter_by(encounter_id=encounter_id, role="user")
-        .order_by(Message.created_at.desc())
-        .first()
-    )
-    chief_complaint = last_user.content[:50] if last_user else None
+        # 主訴（ざっくり抽出：最後の患者発言の先頭50字）
+        last_user = None
+        for m in reversed(rows):
+            if m["role"] == "user":
+                last_user = m["content"]
+                break
+        chief_complaint = (last_user or "")[:50] or None
 
-    # 3) LLMへプロンプト
-    resp = client.chat.completions.create(
-        model=MODEL,
-        temperature=0.2,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"【対話履歴】\n{convo}\n\n以上を踏まえて、見出し付きMarkdownの内科カルテを書いてください。"}
-        ]
-    )
-    note_md = resp.choices[0].message.content
+        # OpenAI で Markdown カルテ生成（キーが無ければ簡易テンプレ）
+        if openai_client:
+            resp = openai_client.chat.completions.create(
+                model=OPENAI_MODEL,
+                temperature=0.2,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"【対話履歴】\n{convo}\n\n以上を踏まえて、見出し付きMarkdownの内科カルテを書いてください。"}
+                ]
+            )
+            note_md = resp.choices[0].message.content
+        else:
+            note_md = (
+                "# 内科カルテ\n\n"
+                f"**主訴**: {chief_complaint or '（未入力）'}\n\n"
+                "**現病歴**: （チャット内容をもとに要約）\n\n"
+                "**既往歴**: \n\n"
+                "**アレルギー**: \n\n"
+                "**内服薬**: \n\n"
+                "**身体所見**: \n\n"
+                "**鑑別診断**: \n\n"
+                "**評価**: \n\n"
+                "**Plan**: 検査/処方/指導/フォローアップ\n\n"
+                f"---\n作成時刻: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
 
-    # 4) 必要なら永続化（DBやS3等）
-    # Encounter.query.filter_by(id=encounter_id).update({"note_md": note_md})
-    # db.session.commit()
-
-    return jsonify({
-        "note_md": note_md,
-        "chief_complaint": chief_complaint,
-        "created_at": datetime.now().isoformat()
-    }), 200
+        return jsonify({
+            "note_md": note_md,
+            "chief_complaint": chief_complaint,
+            "created_at": datetime.now().isoformat()
+        }), 200

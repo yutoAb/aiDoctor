@@ -15,6 +15,10 @@ import {
   Button,
   Divider,
   Tooltip,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  DialogActions,
 } from "@mui/material";
 import SendIcon from "@mui/icons-material/Send";
 import LocalHospitalIcon from "@mui/icons-material/LocalHospital";
@@ -24,10 +28,13 @@ import WarningAmberIcon from "@mui/icons-material/WarningAmber";
 import HealingIcon from "@mui/icons-material/Healing";
 import MedicationIcon from "@mui/icons-material/Medication";
 import AccessTimeIcon from "@mui/icons-material/AccessTime";
+import ContentCopyIcon from "@mui/icons-material/ContentCopy";
+import DownloadIcon from "@mui/icons-material/Download";
 import { useParams, useRouter } from "next/navigation";
 
-type Role = "system" | "assistant" | "user";
-type ChatMessage = {
+// ========== Types ==========
+export type Role = "system" | "assistant" | "user";
+export type ChatMessage = {
   id: string;
   role: Role;
   content: string;
@@ -282,6 +289,17 @@ function QuickReplies({
   );
 }
 
+// ========== Helper: download markdown ==========
+function downloadMarkdown(filename: string, content: string) {
+  const blob = new Blob([content], { type: "text/markdown;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 /* ========== Page ========== */
 export default function ConsultByIdPage() {
   const { encounterId } = useParams<{ encounterId: string }>();
@@ -292,6 +310,12 @@ export default function ConsultByIdPage() {
   const [isSending, setIsSending] = useState(false);
   const [isStreaming, setIsStreaming] = useState(false);
   const [chiefComplaint, setChiefComplaint] = useState<string | undefined>();
+
+  // clinical note states
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [noteMD, setNoteMD] = useState<string>("");
+  const [noteLoading, setNoteLoading] = useState(false);
+
   const sseRef = useRef<EventSource | null>(null);
   const assistantBufferRef = useRef<string>("");
 
@@ -378,7 +402,7 @@ export default function ConsultByIdPage() {
     es.addEventListener("token", (e) => {
       const data = (e as MessageEvent).data;
       try {
-        const parsed = JSON.parse(data);
+        const parsed = JSON.parse(data as string);
         const delta = parsed.delta ?? "";
         assistantBufferRef.current += String(delta);
       } catch {
@@ -449,27 +473,85 @@ export default function ConsultByIdPage() {
       history: "既往歴：",
       allergy: "アレルギー：",
       meds: "服薬中の薬：",
-    };
+    } as const;
     setInput((v) => `${v ? v + "\n" : ""}${templates[kind]}`);
   }, []);
 
-  // 診察終了処理
+  // === 診察終了 → カルテ生成 ===
+  const generateClinicalNote = useCallback(async () => {
+    if (!encounterId) return;
+    setNoteLoading(true);
+    try {
+      // バックエンドで LLM によりカルテを生成して返す想定
+      // 期待レスポンス: { note_md: string, chief_complaint?: string }
+      const res = await fetch(
+        `${API_BASE}/api/encounters/${encodeURIComponent(
+          String(encounterId)
+        )}/clinical-note`,
+        {
+          method: "POST",
+        }
+      );
+      if (!res.ok) throw new Error(`generate note failed: ${res.status}`);
+      const data = await res.json();
+      setNoteMD(String(data?.note_md || ""));
+      if (data?.chief_complaint)
+        setChiefComplaint(String(data.chief_complaint));
+      setNoteOpen(true);
+    } catch (e) {
+      console.error("臨床カルテ生成エラー:", e);
+      // フォールバック: その場で最低限のテンプレを作る
+      const fallback =
+        `# 内科カルテ\n\n` +
+        `**主訴**: ${chiefComplaint ?? "（未入力）"}\n\n` +
+        `**現病歴**: （チャット内容をもとに要約）\n\n` +
+        `**既往歴**: \n\n` +
+        `**アレルギー**: \n\n` +
+        `**内服薬**: \n\n` +
+        `**身体所見**: \n\n` +
+        `**鑑別診断**: \n\n` +
+        `**評価**: \n\n` +
+        `**Plan**: 検査/処方/指導/フォローアップ\n\n` +
+        `---\n作成時刻: ${new Date().toLocaleString()}`;
+      setNoteMD(fallback);
+      setNoteOpen(true);
+    } finally {
+      setNoteLoading(false);
+    }
+  }, [API_BASE, chiefComplaint, encounterId]);
+
   const handleEndConsult = useCallback(async () => {
     try {
-      // 必要に応じてサーバーに終了APIを送る
       await fetch(
         `${API_BASE}/api/encounters/${encodeURIComponent(
           String(encounterId)
         )}/end`,
         { method: "POST" }
       );
+      // 終了後にカルテ生成
+      await generateClinicalNote();
     } catch (e) {
       console.error("診察終了APIエラー:", e);
-    } finally {
-      // トップページへ戻す
-      router.push("/");
+      await generateClinicalNote(); // 終了API失敗時もカルテだけは見せる
     }
-  }, [encounterId, router]);
+  }, [API_BASE, encounterId, generateClinicalNote]);
+
+  // クリップボードへコピー
+  const copyNote = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(noteMD);
+    } catch (e) {
+      console.error("コピー失敗", e);
+    }
+  }, [noteMD]);
+
+  // Markdown を保存
+  const saveNote = useCallback(() => {
+    const filename = `clinical_note_${encounterId}_${new Date()
+      .toISOString()
+      .slice(0, 10)}.md`;
+    downloadMarkdown(filename, noteMD);
+  }, [encounterId, noteMD]);
 
   if (!encounterId) {
     return (
@@ -523,17 +605,60 @@ export default function ConsultByIdPage() {
 
           {/* === 診察終了ボタン === */}
           <Divider sx={{ my: 2 }} />
-          <Stack direction="row" justifyContent="flex-end">
+          <Stack direction="row" justifyContent="flex-end" gap={1}>
             <Button
               variant="contained"
               color="error"
               onClick={handleEndConsult}
+              startIcon={<LocalHospitalIcon />}
             >
-              診察終了
+              診察終了（カルテ生成）
             </Button>
           </Stack>
         </Stack>
       </Container>
+
+      {/* === カルテプレビュー Dialog === */}
+      <Dialog
+        open={noteOpen}
+        onClose={() => setNoteOpen(false)}
+        fullWidth
+        maxWidth="md"
+      >
+        <DialogTitle>内科カルテ（プレビュー）</DialogTitle>
+        <DialogContent dividers>
+          {noteLoading ? (
+            <Stack direction="row" spacing={1} alignItems="center">
+              <CircularProgress size={20} />
+              <Typography variant="body2">カルテを生成しています…</Typography>
+            </Stack>
+          ) : (
+            <Typography
+              component="pre"
+              sx={{ whiteSpace: "pre-wrap", wordBreak: "break-word" }}
+            >
+              {noteMD}
+            </Typography>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={copyNote} startIcon={<ContentCopyIcon />}>
+            コピー
+          </Button>
+          <Button onClick={saveNote} startIcon={<DownloadIcon />}>
+            Markdown保存
+          </Button>
+          <Button
+            onClick={() => {
+              setNoteOpen(false);
+              router.push("/");
+            }}
+            variant="contained"
+          >
+            終了してホームへ
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Box>
   );
 }
